@@ -36,6 +36,7 @@ from xandikos.icalendar import (
     TextMatcher,
     _create_enriched_valarm,
     _event_overlaps_range,
+    _normalize_rrule_until,
     apply_time_range_vevent,
     apply_time_range_valarm,
     apply_time_range_vavailability,
@@ -122,6 +123,38 @@ END:VEVENT
 END:VCALENDAR
 """
 
+EXAMPLE_VCALENDAR_EVOLUTION_RRULE = b"""\
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Ximian//NONSGML Evolution Calendar//EN
+BEGIN:VTIMEZONE
+TZID:Europe/Amsterdam
+BEGIN:DAYLIGHT
+TZOFFSETFROM:+0100
+TZOFFSETTO:+0200
+DTSTART:20090329T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU
+TZNAME:CEST
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:+0200
+TZOFFSETTO:+0100
+DTSTART:20091025T030000
+RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU
+TZNAME:CET
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:evolution-test-rrule@example.com
+DTSTART;TZID=Europe/Amsterdam:20090805T153000
+DTEND;TZID=Europe/Amsterdam:20090805T163000
+RRULE:FREQ=DAILY;UNTIL=20090807T153000
+SUMMARY:Test event with non-UTC UNTIL
+DTSTAMP:20090805T133000Z
+END:VEVENT
+END:VCALENDAR
+"""
+
 
 class ExtractCalendarUIDTests(unittest.TestCase):
     def test_extract_str(self):
@@ -146,6 +179,55 @@ class ExtractCalendarUIDTests(unittest.TestCase):
             ["Invalid character b'\\\\x0c' in field SUMMARY"],
             list(validate_calendar(fi.calendar, strict=False)),
         )
+
+    def test_escaped_newlines_allowed(self):
+        # Test that properly escaped \n and \r sequences are allowed
+        # This is critical for calendar invites from email clients like Thunderbird
+        cal_data = b"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-multiline@example.com
+DTSTART:20250101T120000Z
+SUMMARY:Event with description
+DESCRIPTION:Line 1\\nLine 2\\r\\nLine 3
+END:VEVENT
+END:VCALENDAR
+"""
+        fi = ICalendarFile([cal_data], "text/calendar")
+        # Should validate successfully (no exception raised)
+        fi.validate()
+        # Should have no validation errors
+        self.assertEqual([], list(validate_calendar(fi.calendar, strict=False)))
+
+    def test_evolution_rrule_non_utc_until(self):
+        # Test for issue #80: Evolution generates RRULE with non-UTC UNTIL
+        # when DTSTART is timezone-aware. This should be normalized to UTC.
+        # RFC 5545 requires UNTIL to be in UTC when DTSTART is timezone-aware.
+        from xandikos.icalendar import rruleset_from_comp
+
+        fi = ICalendarFile([EXAMPLE_VCALENDAR_EVOLUTION_RRULE], "text/calendar")
+        fi.validate()
+        self.assertEqual("evolution-test-rrule@example.com", fi.get_uid())
+
+        # Get the VEVENT component
+        vevent = next((c for c in fi.calendar.walk() if c.name == "VEVENT"), None)
+        self.assertIsNotNone(vevent, "VEVENT component not found")
+        self.assertIn("RRULE", vevent, "RRULE property not found in VEVENT")
+
+        # Verify DTSTART is timezone-aware (precondition for the bug)
+        dtstart = vevent["DTSTART"].dt
+        self.assertIsNotNone(dtstart.tzinfo, "DTSTART should be timezone-aware")
+
+        # Parse the RRULE - this should not raise an error after normalization
+        rs = rruleset_from_comp(vevent)
+
+        # Verify we can get occurrences from the rruleset
+        occurrences = list(rs)
+        self.assertGreater(len(occurrences), 0, "RRULE should generate occurrences")
+        # The RRULE is FREQ=DAILY;UNTIL=20090807T153000 with DTSTART on 20090805
+        # so we should get 3 occurrences (Aug 5, 6, 7)
+        self.assertEqual(3, len(occurrences))
 
 
 class CalendarFilterTests(unittest.TestCase):
@@ -2451,3 +2533,112 @@ class EventOverlapsRangeTests(unittest.TestCase):
 
         # All-day event on Jan 16 shouldn't overlap with range 10:00-12:00 on Jan 15
         self.assertFalse(_event_overlaps_range(event, self.start, self.end))
+
+
+class NormalizeRruleUntilTests(unittest.TestCase):
+    """Tests for _normalize_rrule_until function.
+
+    This tests the fix for GitHub issue #571: recurring calendar items with
+    UNTIL that is not in UTC when DTSTART is timezone-aware.
+    """
+
+    def test_naive_until_with_aware_dtstart(self):
+        """Test normalizing naive UNTIL when DTSTART is timezone-aware."""
+        rrule_str = "FREQ=DAILY;UNTIL=20260131T235959"
+        dtstart = datetime(2026, 1, 22, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        normalized = _normalize_rrule_until(rrule_str, dtstart)
+
+        # UNTIL should now have UTC suffix
+        self.assertIn("UNTIL=20260131T235959Z", normalized)
+
+    def test_utc_until_unchanged(self):
+        """Test that UNTIL already in UTC is not modified."""
+        rrule_str = "FREQ=DAILY;UNTIL=20260131T235959Z"
+        dtstart = datetime(2026, 1, 22, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        normalized = _normalize_rrule_until(rrule_str, dtstart)
+
+        # Should be unchanged
+        self.assertEqual(normalized, rrule_str)
+
+    def test_date_only_until_with_aware_dtstart(self):
+        """Test normalizing date-only UNTIL when DTSTART is timezone-aware."""
+        rrule_str = "FREQ=DAILY;UNTIL=20260131"
+        dtstart = datetime(2026, 1, 22, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        normalized = _normalize_rrule_until(rrule_str, dtstart)
+
+        # Should be converted to datetime at end of day in UTC
+        self.assertIn("UNTIL=20260131T235959Z", normalized)
+
+    def test_no_until_unchanged(self):
+        """Test that RRULE without UNTIL is not modified."""
+        rrule_str = "FREQ=DAILY;COUNT=10"
+        dtstart = datetime(2026, 1, 22, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        normalized = _normalize_rrule_until(rrule_str, dtstart)
+
+        self.assertEqual(normalized, rrule_str)
+
+    def test_naive_dtstart_unchanged(self):
+        """Test that RRULE is not modified when DTSTART is naive."""
+        rrule_str = "FREQ=DAILY;UNTIL=20260131T235959"
+        dtstart = datetime(2026, 1, 22, 9, 0, 0)  # Naive datetime
+
+        normalized = _normalize_rrule_until(rrule_str, dtstart)
+
+        # Should be unchanged
+        self.assertEqual(normalized, rrule_str)
+
+    def test_date_only_dtstart_unchanged(self):
+        """Test that RRULE is not modified when DTSTART is date-only."""
+        rrule_str = "FREQ=DAILY;UNTIL=20260131"
+        dtstart = date(2026, 1, 22)  # Date, not datetime
+
+        normalized = _normalize_rrule_until(rrule_str, dtstart)
+
+        # Should be unchanged
+        self.assertEqual(normalized, rrule_str)
+
+    def test_expand_rrule_with_naive_until(self):
+        """Test that expand_calendar_rrule works with naive UNTIL (issue #571)."""
+        # This is the specific case from iPhone clients
+        test_ical = b"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:STANDARD
+DTSTART:20231105T020000
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20240310T020000
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:iphone-test@example.com
+DTSTAMP:20260122T120000Z
+DTSTART;TZID=America/New_York:20260122T090000
+DTEND;TZID=America/New_York:20260122T100000
+SUMMARY:iPhone Event
+RRULE:FREQ=DAILY;UNTIL=20260131T235959
+END:VEVENT
+END:VCALENDAR"""
+
+        from icalendar import Calendar
+
+        cal = Calendar.from_ical(test_ical)
+        start = datetime(2026, 1, 1, tzinfo=ZoneInfo("UTC"))
+        end = datetime(2026, 2, 28, tzinfo=ZoneInfo("UTC"))
+
+        # This should not raise an error
+        expanded = expand_calendar_rrule(cal, start, end)
+
+        # Verify we got the expected number of events
+        events = [comp for comp in expanded.walk() if comp.name == "VEVENT"]
+        self.assertEqual(len(events), 10)  # Jan 22-31 = 10 days

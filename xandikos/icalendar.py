@@ -23,7 +23,7 @@ import logging
 from collections.abc import Iterable
 from datetime import date, datetime, time, timedelta, timezone
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, overload
 from zoneinfo import ZoneInfo
 
 import dateutil.rrule
@@ -36,6 +36,7 @@ from icalendar.prop import (
     vDatetime,
     vDDDTypes,
     vDuration,
+    vRecur,
     vText,
 )
 
@@ -69,22 +70,18 @@ MAX_RECURRENCE_INSTANCES = 3000
 
 
 # Based on RFC5545 section 3.3.11, CONTROL = %x00-08 / %x0A-1F / %x7F
-# All control characters except HTAB (\x09) are forbidden
-_INVALID_CONTROL_CHARACTERS = (
-    [
-        chr(i)
-        for i in range(0x00, 0x09)  # \x00-\x08
-    ]
-    + [
-        chr(i)
-        for i in range(0x0A, 0x20)  # \x0A-\x1F
-    ]
-    + [
-        chr(0x7F)  # DEL character
-    ]
-)
-_INVALID_CONTROL_CHARACTERS.remove("\n")
-_INVALID_CONTROL_CHARACTERS.remove("\r")
+# Control characters are forbidden in TEXT values, EXCEPT:
+# - HTAB (\x09) is explicitly allowed
+# - LF (\x0A) and CR (\x0D) are allowed because they appear in the parsed
+#   representation when the icalendar library unescapes valid \n and \r
+#   escape sequences from the iCalendar file (RFC 5545 allows these escapes)
+_INVALID_CONTROL_CHARACTERS = [
+    chr(i)
+    for i in range(0x00, 0x20)  # \x00-\x1F
+    if i not in (0x09, 0x0A, 0x0D)  # Allow HTAB, LF, CR
+] + [
+    chr(0x7F)  # DEL character
+]
 
 
 class MissingProperty(Exception):
@@ -441,8 +438,17 @@ def apply_time_range_vfreebusy(start, end, comp, tzify):
 def _create_enriched_valarm(alarm: Component, parent: Component) -> Component:
     """Create a modified VALARM component with calculated absolute trigger time.
 
-    This creates a new VALARM that converts relative triggers to absolute
-    triggers based on the parent component's timing properties.
+    This creates a new VALARM that converts relative triggers (e.g., "-PT15M")
+    to absolute trigger times based on the parent component's DTSTART/DUE properties.
+    This enrichment is necessary for time-range filtering to work correctly with
+    relative triggers, and must be applied consistently in both filtering and indexing.
+
+    Args:
+        alarm: The VALARM component to enrich
+        parent: The parent component (VEVENT/VTODO) containing timing information
+
+    Returns:
+        A new VALARM component with absolute TRIGGER if applicable, otherwise unchanged
     """
     from icalendar.cal import Alarm
 
@@ -790,6 +796,8 @@ class ComponentTimeRangeMatcher:
 
             # Parse DTSTART and create rrule
             dtstart_parsed = vDDDTypes.from_ical(dtstart_str)
+            # Normalize UNTIL to be UTC if dtstart is timezone-aware
+            rrule_str = _normalize_rrule_until(rrule_str, dtstart_parsed)
             rrule = dateutil.rrule.rrulestr(rrule_str, dtstart=dtstart_parsed)
         except (TypeError, ValueError) as e:
             # If RRULE parsing fails, log with context and return False
@@ -1085,17 +1093,7 @@ class ComponentFilter:
         # XML elements also match the targeted calendar component;
         for child in self.children:
             if isinstance(child, ComponentFilter):
-                # Special handling for VALARM components with time-range
-                if child.name == "VALARM" and child.time_range is not None:
-                    # Create enriched VALARM components with parent info
-                    subcomponents = []
-                    for c in comp.subcomponents:
-                        if c.name == "VALARM":
-                            # Create a copy with parent info attached
-                            enriched = _create_enriched_valarm(c, comp)
-                            subcomponents.append(enriched)
-                else:
-                    subcomponents = comp.subcomponents
+                subcomponents = self._get_subcomponents_for_matching(child, comp)
                 if not any(child.match(c, tzify) for c in subcomponents):
                     return False
             elif isinstance(child, PropertyFilter):
@@ -1105,6 +1103,25 @@ class ComponentFilter:
                 raise TypeError(child)
 
         return True
+
+    def _get_subcomponents_for_matching(
+        self, child_filter: "ComponentFilter", parent_comp: Component
+    ) -> list[Component]:
+        """Get subcomponents for matching, with special handling for VALARM.
+
+        When filtering VALARM components with time-range, we need to enrich them
+        by converting relative TRIGGER values to absolute times based on the parent
+        component's timing properties.
+        """
+        if child_filter.name == "VALARM" and child_filter.time_range is not None:
+            # Create enriched VALARM components with absolute trigger times
+            return [
+                _create_enriched_valarm(c, parent_comp)
+                for c in parent_comp.subcomponents
+                if c.name == "VALARM"
+            ]
+        else:
+            return parent_comp.subcomponents
 
     def _implicitly_defined(self):
         return any(
@@ -1510,31 +1527,51 @@ class ICalendarFile(File):
         raise KeyError
 
     def _get_index(self, key: IndexKey) -> IndexValueIterator:
+        # Track parent component for VALARM enrichment
         # Use the original calendar without expansion for indexing
         # RRULE expansion will be handled at query time in match_indexes()
-        todo = [(self.calendar, key.split("/"))]
-        rest = []
+        todo: list[tuple[Component, list[str], Component | None]] = [
+            (self.calendar, key.split("/"), None)
+        ]
+        rest: list[tuple[Component, list[str], Component | None]] = []
         c: Component
         while todo:
-            (c, segments) = todo.pop(0)
+            (c, segments, parent) = todo.pop(0)
             if segments and segments[0].startswith("C="):
                 if c.name == segments[0][2:]:
                     if len(segments) > 1 and segments[1].startswith("C="):
-                        todo.extend((comp, segments[1:]) for comp in c.subcomponents)
+                        # Pass current component as parent for subcomponents
+                        todo.extend((comp, segments[1:], c) for comp in c.subcomponents)
                     else:
-                        rest.append((c, segments[1:]))
-        for c, segments in rest:
+                        rest.append((c, segments[1:], parent))
+
+        for c, segments, parent in rest:
             if not segments:
                 yield True
             elif segments[0].startswith("P="):
                 assert len(segments) == 1
+                prop_name = segments[0][2:]
                 try:
-                    p = c[segments[0][2:]]
+                    p = c[prop_name]
                 except KeyError:
                     pass
                 else:
                     if p is not None:
-                        yield p.to_ical()
+                        ical = p.to_ical()
+                        # Special handling for VALARM TRIGGER property
+                        if (
+                            c.name == "VALARM"
+                            and prop_name == "TRIGGER"
+                            and parent is not None
+                            and isinstance(p.dt, timedelta)
+                        ):
+                            # Create enriched VALARM to get absolute trigger time.
+                            # This ensures index values match what the filter will see,
+                            # preventing "index based filter not matching real file filter" errors.
+                            enriched = _create_enriched_valarm(c, parent)
+                            if "TRIGGER" in enriched:
+                                ical = enriched["TRIGGER"].to_ical()
+                        yield ical
             else:
                 raise AssertionError(f"segments: {segments!r}")
 
@@ -1551,6 +1588,16 @@ def as_tz_aware_ts(dt: datetime | date, default_timezone: str | timezone) -> dat
             _dt = _dt.replace(tzinfo=default_timezone)
     assert _dt.tzinfo
     return _dt
+
+
+@overload
+def _normalize_to_dtstart_type(
+    dt_value: date | datetime, dtstart: datetime
+) -> datetime: ...
+
+
+@overload
+def _normalize_to_dtstart_type(dt_value: date | datetime, dtstart: date) -> date: ...
 
 
 def _normalize_to_dtstart_type(
@@ -1615,9 +1662,51 @@ def _normalize_to_dtstart_type(
     return dt_value
 
 
+def _normalize_rrule_until(rrule_str: str, dtstart: date | datetime) -> str:
+    """Normalize RRULE UNTIL to be compatible with dateutil when DTSTART is timezone-aware.
+
+    RFC 5545 requires UNTIL to be in UTC when DTSTART is timezone-aware.
+    Some clients (like iPhone) send UNTIL without UTC suffix.
+    This function parses the RRULE and ensures UNTIL is properly formatted.
+
+    Args:
+        rrule_str: The RRULE string
+        dtstart: The DTSTART value (used to determine if normalization is needed)
+
+    Returns:
+        The RRULE string, possibly modified to have UNTIL in UTC format
+    """
+    # Only normalize if dtstart is a timezone-aware datetime
+    if not isinstance(dtstart, datetime) or dtstart.tzinfo is None:
+        return rrule_str
+
+    parsed = vRecur.from_ical(rrule_str)
+    until_list = parsed.get("UNTIL", [])
+
+    if not until_list:
+        return rrule_str
+
+    until = until_list[0]
+
+    # If UNTIL is a date (not datetime), convert to end of day in UTC
+    if isinstance(until, date) and not isinstance(until, datetime):
+        until_dt = datetime.combine(until, time(23, 59, 59), tzinfo=timezone.utc)
+        parsed["UNTIL"] = [until_dt]
+        return parsed.to_ical().decode("utf-8")
+
+    # If UNTIL is a naive datetime, make it UTC (issue #80, #571)
+    if isinstance(until, datetime) and until.tzinfo is None:
+        parsed["UNTIL"] = [until.replace(tzinfo=timezone.utc)]
+        return parsed.to_ical().decode("utf-8")
+
+    return rrule_str
+
+
 def rruleset_from_comp(comp: Component) -> dateutil.rrule.rruleset:
     dtstart = comp["DTSTART"].dt
     rrulestr = comp["RRULE"].to_ical().decode("utf-8")
+    # Normalize UNTIL to be UTC if dtstart is timezone-aware
+    rrulestr = _normalize_rrule_until(rrulestr, dtstart)
     rrule = dateutil.rrule.rrulestr(rrulestr, dtstart=dtstart)
     rs = dateutil.rrule.rruleset()
     rs.rrule(rrule)  # type: ignore
@@ -1673,6 +1762,8 @@ def rruleset_from_comp(comp: Component) -> dateutil.rrule.rruleset:
                 rs.rdate(normalized)
     if "EXRULE" in comp:
         exrulestr = comp["EXRULE"].to_ical().decode("utf-8")
+        # Normalize UNTIL to be UTC if dtstart is timezone-aware
+        exrulestr = _normalize_rrule_until(exrulestr, dtstart)
         exrule = dateutil.rrule.rrulestr(exrulestr, dtstart=dtstart)
         assert isinstance(exrule, dateutil.rrule.rrule)
         rs.exrule(exrule)
